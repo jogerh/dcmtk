@@ -2315,6 +2315,13 @@ requestAssociationTCP(PRIVATE_NETWORKKEY ** network,
 #endif /* __MINGW32__ */
 #endif /* DCMTK_HAVE_POLL */
 
+        fd_set fdRead;
+        FD_ZERO(&fdRead);
+        if (params->cancelSocket != DCMNET_INVALID_SOCKET)
+        {
+            FD_SET(params->cancelSocket, &fdRead);
+        }
+
         struct timeval timeout;
         timeout.tv_sec = connectTimeout;
         timeout.tv_usec = 0;
@@ -2328,9 +2335,15 @@ requestAssociationTCP(PRIVATE_NETWORKKEY ** network,
             rc = poll(pfd, 1, timeout.tv_sec*1000+(timeout.tv_usec/1000));
 #else
             // the typecast is safe because Windows ignores the first select() parameter anyway
-            rc = select(OFstatic_cast(int, s + 1), NULL, &fdSet, NULL, &timeout);
+            rc = select(OFstatic_cast(int, s + 1), &fdRead, &fdSet, NULL, &timeout);
 #endif
         } while (rc == -1 && OFStandard::getLastNetworkErrorCode().value() == DCMNET_EINTR);
+
+        bool cancelled = false;
+        if (FD_ISSET(params->cancelSocket, &fdRead))
+        {
+            cancelled = true;
+        }
 
         if (DCM_dcmnetLogger.isEnabledFor(OFLogger::DEBUG_LOG_LEVEL))
         {
@@ -2344,9 +2357,9 @@ requestAssociationTCP(PRIVATE_NETWORKKEY ** network,
 #else
         fcntl(s, F_SETFL, flags);
 #endif
-        if (rc == 0)
+        if (rc == 0 || cancelled)
         {
-            // timeout reached, bail out with error return code
+            // timeout reached or cancelled, bail out with error return code
 #ifdef HAVE_WINSOCK_H
             (void) shutdown(s,  1 /* SD_SEND */);
             (void) closesocket(s);
@@ -2359,7 +2372,7 @@ requestAssociationTCP(PRIVATE_NETWORKKEY ** network,
 
             OFString msg = "TCP Initialization Error: ";
             msg += OFStandard::getLastNetworkErrorCode().message();
-            msg += " (Timeout)";
+            msg += (cancelled ? " (cancelled)" : " (Timeout)");
             return makeDcmnetCondition(DULC_TCPINITERROR, OF_error, msg.c_str());
   }
 #ifndef HAVE_WINSOCK_H

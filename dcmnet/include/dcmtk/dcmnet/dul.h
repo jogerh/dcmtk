@@ -203,6 +203,7 @@ typedef struct {
 
     OFBool useSecureLayer;
     Sint32 tcpConnectTimeout;
+    DcmNativeSocketType cancelSocket; // Allows cancelling ongoing blocking select()
 }   DUL_ASSOCIATESERVICEPARAMETERS;
 
 /** Enum describing the possible role settings for role negotiation sub items.
