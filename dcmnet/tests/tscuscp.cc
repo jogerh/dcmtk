@@ -18,7 +18,6 @@
  *
  */
 
-
 #include "dcmtk/config/osconfig.h"    /* make sure OS specific configuration is included first */
 
 #ifdef WITH_THREADS
@@ -28,6 +27,13 @@
 #include "dcmtk/ofstd/ofrand.h"
 #include "dcmtk/dcmnet/scp.h"
 #include "dcmtk/dcmnet/scu.h"
+#include "dcmtk/dcmnet/dulstruc.h"
+#include "dcmtk/ofstd/ofsockad.h"
+
+
+#ifdef _WIN32
+#include <winsock2.h>
+#endif
 
 
 static OFLogger t_scuscp_logger= OFLog::getLogger("dcmtk.test.tscuscp");
@@ -1114,5 +1120,188 @@ OFTEST(dcmnet_scu_sendNSETRequest_succeeds_and_sets_responsestatuscode_from_scp_
     OFCHECK_MSG((result = fixture.mppsSCU.releaseAssociation()).good(), result.text());
 }
 
+// Use the TestScp to obtain a free port from the OS.
+// Since the TestScp is destroyed, there is a slight
+// chance that the port is taken by other processes
+// immediately, but this is quite unlikely
+static Uint16 GetPortThatIsLikelyNotUsed ()
+{
+	TestSCP scp;
+	DcmSCPConfig& config = scp.getConfig();
+	configure_scp_for_echo(config, 0);
+	config.setAETitle("STOP_AFTER_ASSOC");
+	config.setConnectionBlockingMode(DUL_BLOCK);
+	OFCHECK(scp.openListenPort().good());
+	return config.getPort();
+}
+
+OFTEST(dcmnet_ASC_requestAssociation_returns_DULC_TCPINITERROR_whenTimedOut)
+{
+    Uint16 port = GetPortThatIsLikelyNotUsed();
+
+	char peerAddress[64] = {};
+    sprintf(peerAddress, "localhost:%hu", port);
+
+    T_ASC_Parameters* params = NULL;
+
+    const Sint32 timeout = 1;
+    OFCHECK(ASC_createAssociationParameters(&params, 4*1024, timeout).good());
+    OFCHECK(ASC_setAPTitles(params, "Our AE", "Peer AE", NULL).good());
+    OFCHECK(ASC_setPresentationAddresses(params, "localhost", peerAddress).good());
+
+	const char* xferSyn[] = { "2.3.4.5" };
+    OFCHECK(ASC_addPresentationContext(params, 1, "1.2.3.4", xferSyn, 1).good());
+
+	T_ASC_Network* network = {};
+    OFCHECK(ASC_initializeNetwork(NET_REQUESTOR, 0, 60, &network).good());
+
+	T_ASC_Association* assoc = NULL;
+    const OFCondition result = ASC_requestAssociation(network, params, &assoc);
+    OFCHECK(result.code() == DULC_TCPINITERROR);
+    OFCHECK(OFString(result.text()).find("Timeout") != OFString_npos);
+
+	OFCHECK(ASC_destroyAssociation(&assoc).good());
+    OFCHECK(ASC_dropNetwork(&network).good());
+}
+
+struct SocketHandle
+{
+#ifdef _WIN32
+    typedef SOCKET SocketT;
+#else
+    typedef int SocketT;
+#endif
+
+    SocketHandle()
+		: m_socket(INVALID_SOCKET)
+    {
+    }
+
+    explicit SocketHandle(SocketT socket)
+		: m_socket(socket)
+    {
+    }
+
+    SocketT Get() const
+    {
+        return m_socket;
+    }
+
+    void Set(SocketT socket)
+    {
+        if (Valid())
+            closesocket(m_socket);
+        m_socket = socket;
+    }
+
+    bool Valid() const
+    {
+#ifdef _WIN32
+        return m_socket != INVALID_SOCKET;
+#else
+        return m_socket < 0;
+#endif
+    }
+
+    ~SocketHandle() {
+        if (Valid())
+            closesocket(m_socket);
+    }
+private:
+
+    SocketHandle(const SocketHandle&); // Deleted
+    SocketHandle& operator=(const SocketHandle&); // Deleted
+
+    SocketT m_socket;
+};
+
+struct SocketPair
+{
+	static int CreateSocketPair(SocketPair& socketPair)
+	{
+        // Create a socket to 
+		const SocketHandle loopBackSock(::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
+        if (!loopBackSock.Valid())
+            return -1;
+
+        sockaddr_in inaddr = {};
+		inaddr.sin_family = AF_INET;
+		inaddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		inaddr.sin_port = 0;
+
+		const int yes = 1;
+		int result = setsockopt(loopBackSock.Get(), SOL_SOCKET, SO_REUSEADDR, OFreinterpret_cast(const char*, &yes), sizeof(yes));
+        if (result != 0)
+            return result;
+
+		result = bind(loopBackSock.Get(), OFreinterpret_cast(sockaddr*, &inaddr), sizeof(inaddr));
+        if (result != 0)
+            return result;
+
+		result = listen(loopBackSock.Get(), 1);
+        if (result != 0)
+            return result;
+
+		int len = sizeof(inaddr);
+        sockaddr addr = {};
+		result = getsockname(loopBackSock.Get(), &addr, &len);
+        if (result != 0)
+            return result;
+
+        socketPair.m_s[0].Set(::socket(AF_INET, SOCK_STREAM, 0));
+		result = connect(socketPair.m_s[0].Get(), &addr, len);
+        if (result != 0)
+            return result;
+
+        socketPair.m_s[1].Set(accept(loopBackSock.Get(), NULL, NULL));
+        if (!socketPair.m_s[1].Valid())
+            return -1;
+
+		return closesocket(loopBackSock.Get());
+	}
+
+    int SendData()
+    {
+        const char buf[1] = "";
+        return send(m_s[0].Get(), buf, 1, 0);
+    }
+
+    SocketHandle m_s[2];
+};
+
+OFTEST(dcmnet_ASC_requestAssociation_returns_DULC_TCPINITERROR_whenCanceled)
+{
+    Uint16 port = GetPortThatIsLikelyNotUsed();
+
+    char peerAddress[64] = {};
+    sprintf(peerAddress, "localhost:%hu", port);
+
+    T_ASC_Parameters* params = NULL;
+    Sint32 timeout = 120; // Should block for a long time
+    OFCHECK(ASC_createAssociationParameters(&params, 4 * 1024, timeout).good());
+
+	SocketPair cancelSocket;
+    OFCHECK(SocketPair::CreateSocketPair(cancelSocket) == 0);
+    
+    params->DULparams.cancelSocket = cancelSocket.m_s[1].Get();
+
+    cancelSocket.SendData();
+    OFCHECK(ASC_setAPTitles(params, "Our AE", "Peer AE", NULL).good());
+    OFCHECK(ASC_setPresentationAddresses(params, "localhost", peerAddress).good()); // Assumes that 48556 is never going to respond
+
+    const char* xferSyn[] = { "2.3.4.5" };
+    OFCHECK(ASC_addPresentationContext(params, 1, "1.2.3.4", xferSyn, 1).good());
+
+    T_ASC_Network* network = {};
+    OFCHECK(ASC_initializeNetwork(NET_REQUESTOR, 0, 60, &network).good());
+
+    T_ASC_Association* assoc = NULL;
+    const OFCondition result = ASC_requestAssociation(network, params, &assoc);
+    OFCHECK(result.code() == DULC_TCPINITERROR);
+    OFCHECK(OFString(result.text()).find("cancelled") != OFString_npos);
+
+    OFCHECK(ASC_destroyAssociation(&assoc).good());
+    OFCHECK(ASC_dropNetwork(&network).good());
+}
 
 #endif // WITH_THREADS
